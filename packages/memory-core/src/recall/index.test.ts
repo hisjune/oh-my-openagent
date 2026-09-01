@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test"
+import * as memoryCore from "../index"
 import {
   RecallCorpusCache,
   RecallLedger,
-  appendRecallReceipt,
   loadRecallCorpus,
   planRecallQueries,
   renderRecallMessage,
@@ -20,6 +20,10 @@ describe("recall package surface", () => {
     expect(typeof renderRecallMessage).toBe("function")
     expect(typeof RecallLedger).toBe("function")
     expect(typeof sanitizeSessionFilename).toBe("function")
-    expect(typeof appendRecallReceipt).toBe("function")
+  })
+
+  it("#given the package barrel #when the recall surface is imported #then the receipts audit trail is gone", () => {
+    // given / when / then
+    expect(memoryCore).not.toHaveProperty("appendRecallReceipt")
   })
 })
