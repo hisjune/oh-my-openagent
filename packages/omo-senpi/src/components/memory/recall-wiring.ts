@@ -32,10 +32,6 @@ import { resolveMemorySettings } from "./identity-runtime"
 export interface ResolvedMemoryRecallSettings {
   readonly enabled: boolean
   readonly max_items: number
-  readonly budget_tokens: number
-  readonly excerpt_chars: number
-  readonly min_score?: number
-  readonly exclude: readonly string[]
 }
 
 /** Base recall block under the bound agent's layer override, mirroring the nudge/reflection pattern. */
@@ -115,7 +111,6 @@ export function createMemoryRecallWiring(options: MemoryRecallWiringOptions): Me
     const ledger = ledgerFor(context)
     const candidates = selectRecallCandidates(corpus.documents, queries, {
       maxItems: recall.max_items,
-      excerptChars: recall.excerpt_chars,
       surfaced: await ledger.surfacedPaths(session.id),
     })
     if (candidates.length === 0) return undefined
