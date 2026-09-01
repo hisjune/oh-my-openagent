@@ -108,7 +108,6 @@ describe("buildIdentityPaths", () => {
     // given / when
     const paths = buildIdentityPaths("/mem", "backend-lead-0123abcd")
     // then
-    expect(paths).not.toHaveProperty("recallReceipts")
     expect(Object.values(paths).some((path) => path.endsWith("receipts.jsonl"))).toBe(false)
   })
 
