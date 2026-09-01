@@ -101,6 +101,7 @@ describe("buildIdentityPaths", () => {
     expect(paths.toolReceipts).toBe(join(runtime, "tool-receipts"))
     expect(paths.recall).toBe(join(runtime, "recall"))
     expect(paths.recallLedger).toBe(join(runtime, "recall", "ledger"))
+    expect(paths.recallPending).toBe(join(runtime, "recall", "pending"))
   })
 
   it("#given the recall runtime tree #when paths are built #then no receipts log is declared", () => {

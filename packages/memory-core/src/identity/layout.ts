@@ -40,9 +40,10 @@ export interface MemoryIdentityPaths {
   facts: string
   notices: string
   toolReceipts: string
-  /** Recall runtime tree: per-session surfaced-path ledgers. */
+  /** Recall runtime tree: per-session surfaced-path ledgers and pending gate nudges. */
   recall: string
   recallLedger: string
+  recallPending: string
 }
 
 export function defaultMemoryRoot(): string {
@@ -77,5 +78,6 @@ export function buildIdentityPaths(memoryRoot: string, id: string): MemoryIdenti
     toolReceipts: join(runtime, "tool-receipts"),
     recall: join(runtime, "recall"),
     recallLedger: join(runtime, "recall", "ledger"),
+    recallPending: join(runtime, "recall", "pending"),
   }
 }
