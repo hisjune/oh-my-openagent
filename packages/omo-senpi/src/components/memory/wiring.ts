@@ -11,6 +11,7 @@ import { type SkillsUsageTracker } from "./skills-usage"
 import { type MemoryUsageTracker } from "./memory-usage"
 import { createMemoryNoticeWiring } from "./memory-notice-wiring"
 import { createMemorianGateWiring } from "./memorian-wiring"
+import { resolveMemoryModelRegistry } from "./model-registry-resolver"
 import { createMemoryRecallWiring } from "./recall-wiring"
 import { branchEntryCount } from "./wiring-context"
 import {
@@ -83,6 +84,11 @@ export function createMemoryWiring(options: MemoryWiringOptions): MemoryWiring {
   // nudges are what recallWiring's before_agent_start handler injects on the NEXT turn.
   const memorianGateWiring = createMemorianGateWiring({
     collectCandidates: (eventCtx) => recallWiring.collectCandidates(eventCtx),
+    // The gate launch is fire-and-forget, so every ctx read must happen synchronously inside the
+    // settle handler: the host disposes the ctx the moment that handler returns.
+    snapshotSession: (eventCtx) => recallWiring.snapshotSession(eventCtx),
+    collectCandidatesFromSnapshot: (snapshot) => recallWiring.collectCandidatesFromSnapshot(snapshot),
+    resolveModelRegistry: (eventCtx) => resolveMemoryModelRegistry(eventCtx),
     resolveContext,
     runnerFor: memorianRunnerFor,
     ...(options.logger === undefined ? {} : { logger: options.logger }),

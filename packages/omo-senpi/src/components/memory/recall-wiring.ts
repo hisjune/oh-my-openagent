@@ -96,10 +96,27 @@ export interface CollectedRecallCandidates {
   readonly transcript: readonly RecallTranscriptTurn[]
 }
 
+/**
+ * The ctx-derived half of a settle, read synchronously while the ctx is still alive. The memorian
+ * gate detaches its launch, and the host disposes the ctx as soon as the settle handler returns, so
+ * the gate captures this first and the async work consumes only these plain values.
+ */
+export interface RecallSessionSnapshot {
+  readonly id: string
+  readonly entries: readonly unknown[]
+}
+
 export interface MemoryRecallWiring {
   register(pi: MemoryExtensionAPI): void
   /** Settle-time seam: lexical candidates for the completed turn, or undefined when there are none. */
   collectCandidates(eventCtx: unknown): Promise<CollectedRecallCandidates | undefined>
+  /**
+   * Synchronous ctx read for detached callers. Returns undefined when the ctx carries no usable
+   * session; never throws, so a disposed ctx degrades to "no candidates" instead of a failed turn.
+   */
+  snapshotSession(eventCtx: unknown): RecallSessionSnapshot | undefined
+  /** Collection over an already-captured snapshot; touches no ctx at all. */
+  collectCandidatesFromSnapshot(snapshot: RecallSessionSnapshot): Promise<CollectedRecallCandidates | undefined>
 }
 
 // A memory worker child must never receive recall hints: it reasons ABOUT memory, and an injected
@@ -126,6 +143,12 @@ export function createMemoryRecallWiring(options: MemoryRecallWiringOptions): Me
     // same way the before_agent_start handler reads it.
     const session = readSession(eventCtx)
     if (session === undefined) return undefined
+    return await collectFrom(session)
+  }
+
+  /** The ctx-free remainder of collection: everything below runs off plain captured values. */
+  async function collectFrom(session: RecallSession): Promise<CollectedRecallCandidates | undefined> {
+    if (CHILD_SENTINELS.some((sentinel) => options.env[sentinel] === "1")) return undefined
     const context = options.resolveContext(session.id)
     if (context === undefined) return undefined
 
@@ -230,6 +253,23 @@ export function createMemoryRecallWiring(options: MemoryRecallWiringOptions): Me
         return await collect(eventCtx)
       } catch (error) {
         // Read-only advice: any failure drops the collection and leaves the turn untouched.
+        options.logger?.warn("omo-senpi memory recall candidate collection skipped", { error: describe(error) })
+        return undefined
+      }
+    },
+    snapshotSession(eventCtx): RecallSessionSnapshot | undefined {
+      try {
+        return readSession(eventCtx)
+      } catch (error) {
+        // A disposed ctx throws on every property read; that is a silent skip, not a turn failure.
+        options.logger?.warn("omo-senpi memory recall session snapshot skipped", { error: describe(error) })
+        return undefined
+      }
+    },
+    async collectCandidatesFromSnapshot(snapshot): Promise<CollectedRecallCandidates | undefined> {
+      try {
+        return await collectFrom(snapshot)
+      } catch (error) {
         options.logger?.warn("omo-senpi memory recall candidate collection skipped", { error: describe(error) })
         return undefined
       }

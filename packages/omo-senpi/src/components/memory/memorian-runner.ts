@@ -53,6 +53,13 @@ export interface MemorianGateLaunchInput {
   readonly surfaced: ReadonlySet<string>
   readonly maxItems: number
   readonly transcript: readonly MemorianTranscriptTurn[]
+  /**
+   * The model registry captured SYNCHRONOUSLY at settle, before the host disposed the senpi ctx.
+   * The gate launch is fire-and-forget, so by the time it runs the ctx-reading resolver would throw
+   * `assertActive`'s stale error and silently fail the launch. When present this snapshot is
+   * authoritative and the resolver is never consulted.
+   */
+  readonly modelRegistry?: SenpiModelRegistryPort<SenpiModelPort> | undefined
 }
 
 export type MemorianGateLaunchResult =
@@ -92,7 +99,9 @@ export class MemorianGateRunner {
   private async launchOnce(input: MemorianGateLaunchInput): Promise<MemorianGateLaunchResult> {
     if (input.candidates.length === 0 || input.maxItems <= 0) return { status: "skipped" }
     const loaded = this.options.loadConfig()
-    const resolution = resolveReflectionModel(QUICK_CATEGORY, loaded.config, this.options.resolveModelRegistry())
+    // Prefer the settle-time snapshot: reading the ctx from this detached task races session dispose.
+    const registry = input.modelRegistry ?? this.options.resolveModelRegistry()
+    const resolution = resolveReflectionModel(QUICK_CATEGORY, loaded.config, registry)
     if (resolution.kind === "category_unavailable") {
       // Same decision as the facts extractor: the gate is quick-pinned and never falls back to a
       // pricier category, because an advisory read must not cost more than the turn it advises.

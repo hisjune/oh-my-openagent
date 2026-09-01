@@ -7,10 +7,11 @@
 // advisory, and a turn must never pay for the advice about the turn that just ended.
 
 import { PendingNudges, type RecallCandidate } from "@oh-my-opencode/memory-core"
+import type { SenpiModelPort, SenpiModelRegistryPort } from "@oh-my-opencode/senpi-task"
 
 import type { ComponentLogger } from "../../extension/types"
 import type { MemoryIdentityContext } from "./context"
-import type { CollectedRecallCandidates, RecallTranscriptTurn } from "./recall-wiring"
+import type { CollectedRecallCandidates, RecallSessionSnapshot, RecallTranscriptTurn } from "./recall-wiring"
 
 /** The runner seam. Tests and the QA driver substitute a stub; production passes the real runner. */
 export interface MemorianGatePort {
@@ -20,14 +21,27 @@ export interface MemorianGatePort {
     readonly surfaced: ReadonlySet<string>
     readonly maxItems: number
     readonly transcript: readonly RecallTranscriptTurn[]
+    /** Captured at settle, before the host disposed the ctx the registry lives on. */
+    readonly modelRegistry?: SenpiModelRegistryPort<SenpiModelPort> | undefined
   }): Promise<unknown>
 }
 
 export interface MemorianGateWiringOptions {
   /** Settle-time lexical collection; undefined already means disabled, sentinel, or no match. */
   readonly collectCandidates: (eventCtx: unknown) => Promise<CollectedRecallCandidates | undefined>
+  /** Synchronous ctx read, called before the launch detaches. */
+  readonly snapshotSession?: (eventCtx: unknown) => RecallSessionSnapshot | undefined
+  /** Collection over the captured snapshot; consumes no ctx. */
+  readonly collectCandidatesFromSnapshot?: (
+    snapshot: RecallSessionSnapshot,
+  ) => Promise<CollectedRecallCandidates | undefined>
   readonly resolveContext: (sessionId: string) => MemoryIdentityContext | undefined
   readonly runnerFor: (context: MemoryIdentityContext) => MemorianGatePort
+  /**
+   * Reads the model registry off the live senpi ctx. Called SYNCHRONOUSLY inside onSettled, because
+   * the host disposes the ctx the moment the handler returns and every later read throws.
+   */
+  readonly resolveModelRegistry?: (eventCtx: unknown) => SenpiModelRegistryPort<SenpiModelPort> | undefined
   readonly pendingFor?: (context: MemoryIdentityContext) => Pick<PendingNudges, "take">
   readonly logger?: ComponentLogger
 }
@@ -61,8 +75,23 @@ export function createMemorianGateWiring(options: MemorianGateWiringOptions): Me
 
   return {
     onSettled(eventCtx: unknown): void {
+      // Snapshot every ctx-derived input BEFORE detaching. The launch below is fire-and-forget by
+      // contract, and the host runs AgentSession dispose -> _extensionRunner.invalidate() as soon as
+      // this handler returns; any ctx read from the detached task then throws the stale-ctx error and
+      // the gate silently never spawns. Everything the async part consumes is a plain value.
+      let modelRegistry: SenpiModelRegistryPort<SenpiModelPort> | undefined
+      try {
+        modelRegistry = options.resolveModelRegistry?.(eventCtx)
+      } catch (error) {
+        // Fail-open: an unreadable registry only means the runner resolves the category itself.
+        options.logger?.warn("omo-senpi memorian gate registry snapshot skipped", { error: describe(error) })
+      }
+      const session = options.snapshotSession?.(eventCtx)
+      const collectFromSnapshot = options.collectCandidatesFromSnapshot
       track(async () => {
-        const collected = await options.collectCandidates(eventCtx)
+        const collected = session !== undefined && collectFromSnapshot !== undefined
+          ? await collectFromSnapshot(session)
+          : await options.collectCandidates(eventCtx)
         if (collected === undefined) return
         await options.runnerFor(collected.context).launch({
           sessionId: collected.sessionId,
@@ -70,6 +99,7 @@ export function createMemorianGateWiring(options: MemorianGateWiringOptions): Me
           surfaced: collected.surfaced,
           maxItems: collected.maxItems,
           transcript: collected.transcript,
+          ...(modelRegistry === undefined ? {} : { modelRegistry }),
         })
       })
     },

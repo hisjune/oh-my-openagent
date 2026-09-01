@@ -135,6 +135,49 @@ describe("createMemorianGateWiring onSettled", () => {
     expect(logs).toHaveLength(1)
   })
 
+  test("#given a ctx that goes stale once the handler returns #when a turn settles #then the launch still uses the snapshotted registry", async () => {
+    // given: the real senpi ctx is invalidated by AgentSession dispose the moment the settle
+    // handler returns, so any ctx read from the detached task throws assertActive's stale error.
+    const identity = await context()
+    const registry = { getAvailable: () => [], find: () => undefined }
+    let stale = false
+    const eventCtx = {
+      get modelRegistry(): unknown {
+        if (stale) throw new Error("This extension ctx is stale after session replacement or reload.")
+        return registry
+      },
+    }
+    const launches: Launch[] = []
+    const logs: Array<{ message: string, details?: unknown }> = []
+    const wiring = createMemorianGateWiring({
+      // Collection is handed the snapshot, never the live ctx.
+      collectCandidates: async () => collected(identity),
+      resolveContext: () => identity,
+      runnerFor: () => ({
+        launch: async (launchInput) => {
+          launches.push(launchInput)
+          return { status: "empty" as const }
+        },
+      }),
+      resolveModelRegistry: (ctx) => (ctx as { modelRegistry?: unknown }).modelRegistry as never,
+      logger: {
+        info: (message, details) => logs.push({ message, details }),
+        warn: (message, details) => logs.push({ message, details }),
+        error: (message, details) => logs.push({ message, details }),
+      },
+    })
+
+    // when: the handler returns, THEN the host disposes the ctx
+    wiring.onSettled(eventCtx)
+    stale = true
+    await wiring.whenIdle()
+
+    // then: the gate still launched, carrying the registry captured before dispose
+    expect(logs).toEqual([])
+    expect(launches).toHaveLength(1)
+    expect(launches[0]?.modelRegistry).toBe(registry)
+  })
+
   test("#given a settle #when the handler returns #then it never waits on the gate child", async () => {
     // given: the settle path must not block on an advisory read
     const identity = await context()

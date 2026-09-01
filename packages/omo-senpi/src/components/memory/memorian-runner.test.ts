@@ -102,6 +102,33 @@ describe("MemorianGateRunner", () => {
     ])
   }, 30_000)
 
+  test("#given a snapshotted registry on the input #when the ctx resolver would throw stale #then the launch still succeeds", async () => {
+    // given: production hands the runner a registry captured synchronously at settle, so the
+    // detached launch must never fall back to reading the (now disposed) senpi ctx.
+    const { root, identityPaths } = await fixture()
+    const stub = stubChild(root, WRITE_ONE_NUDGE)
+    const runner = new MemorianGateRunner(runnerOptions(identityPaths, {
+      ...stub,
+      resolveModelRegistry: () => {
+        throw new Error("This extension ctx is stale after session replacement or reload.")
+      },
+    }))
+
+    // when
+    const result = await runner.launch(launchInput({
+      modelRegistry: {
+        getAvailable: () => [MODEL],
+        find: (provider, modelId) => (provider === MODEL.provider && modelId === MODEL.id ? MODEL : undefined),
+      },
+    }))
+
+    // then
+    expect(result.status).toBe("nudged")
+    expect(await new PendingNudges(identityPaths.recallPending).take(SESSION_ID)).toEqual([
+      { path: CANDIDATE_PATH, hint: "Drain nodes before a rollout." },
+    ])
+  }, 30_000)
+
   test("#given the quick category cannot resolve #when the runner launches #then it warns, skips and spawns nothing", async () => {
     // given
     const { identityPaths } = await fixture()
