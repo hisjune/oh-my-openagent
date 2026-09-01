@@ -10,6 +10,7 @@ import { createShutdownDrain, type ShutdownDrainInput, type ShutdownEvaluator } 
 import { type SkillsUsageTracker } from "./skills-usage"
 import { type MemoryUsageTracker } from "./memory-usage"
 import { createMemoryNoticeWiring } from "./memory-notice-wiring"
+import { createMemorianGateWiring } from "./memorian-wiring"
 import { createMemoryRecallWiring } from "./recall-wiring"
 import { branchEntryCount } from "./wiring-context"
 import {
@@ -39,7 +40,7 @@ export function createMemoryWiring(options: MemoryWiringOptions): MemoryWiring {
       onLiveCompletion: reflectionLive.onLiveReflectionCompleted,
     },
   )
-  const { resolveContext, journalWiringFor, factsWiringFor, runtimeFor } = runtimeWiring
+  const { resolveContext, journalWiringFor, factsWiringFor, memorianRunnerFor, runtimeFor } = runtimeWiring
 
   const nudgeWiring = createMemoryNudgeWiring({
     resolveContext,
@@ -76,6 +77,14 @@ export function createMemoryWiring(options: MemoryWiringOptions): MemoryWiring {
     resolveContext,
     resolveSettings: () => resolveMemorySettings(options.loadConfig({ cwd: options.cwd() }).config.memory),
     env: options.env,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+  })
+  // The settle half of the recall channel: collection feeds the gate child, and the gate's pending
+  // nudges are what recallWiring's before_agent_start handler injects on the NEXT turn.
+  const memorianGateWiring = createMemorianGateWiring({
+    collectCandidates: (eventCtx) => recallWiring.collectCandidates(eventCtx),
+    resolveContext,
+    runnerFor: memorianRunnerFor,
     ...(options.logger === undefined ? {} : { logger: options.logger }),
   })
 
@@ -142,6 +151,7 @@ export function createMemoryWiring(options: MemoryWiringOptions): MemoryWiring {
         nudgeWiring,
         noticeWiring,
         recallWiring,
+        memorianGateWiring,
         dreamTriggerWiring,
         completionApi: createReflectionCompletionApi,
         resolveContext,

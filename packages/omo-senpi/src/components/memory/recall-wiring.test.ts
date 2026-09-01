@@ -5,7 +5,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import type { BeforeAgentStartEventResult } from "@code-yeongyu/senpi"
-import { GitMemoryRepo, RecallLedger, buildIdentityPaths } from "@oh-my-opencode/memory-core"
+import {
+  GitMemoryRepo,
+  PendingNudges,
+  RecallLedger,
+  buildIdentityPaths,
+  renderNudgeBlock,
+} from "@oh-my-opencode/memory-core"
 
 import { MemoryFakeExtensionAPI, memorySettings } from "./memory.test-support"
 import { createMemoryBinding } from "./binding"
@@ -143,6 +149,152 @@ describe("RECALL_CUSTOM_TYPE", () => {
     // given / when / then
     expect(RECALL_CUSTOM_TYPE).toBe("omo-memorian:recall")
   })
+})
+
+const NUDGE = { path: ROLLOUTS_PATH, hint: "Drain kubernetes nodes before a rollout." }
+
+describe("createMemoryRecallWiring pending-nudge injection", () => {
+  test("#given a pending nudge from the gate #when before_agent_start dispatches #then the hidden sourced block is injected", async () => {
+    // given
+    const { repo, context } = await fixture()
+    await new PendingNudges(context.identityPaths.recallPending).write(SESSION_ID, [NUDGE])
+    const pi = new MemoryFakeExtensionAPI()
+    wiringFor({ repo, identity: context }).register(pi)
+
+    // when
+    const result = await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+    // then
+    expect(result?.message).toEqual({
+      customType: RECALL_CUSTOM_TYPE,
+      content: renderNudgeBlock(NUDGE),
+      display: false,
+    })
+    expect(result?.message?.content).toContain(`<recalled-memory source="[[${ROLLOUTS_PATH}]]">`)
+  }, 30_000)
+
+  test("#given an injected nudge #when the turn starts #then the path is ledgered and the pending file is consumed", async () => {
+    // given
+    const { repo, context } = await fixture()
+    const pending = new PendingNudges(context.identityPaths.recallPending)
+    await pending.write(SESSION_ID, [NUDGE])
+    const pi = new MemoryFakeExtensionAPI()
+    wiringFor({ repo, identity: context }).register(pi)
+
+    // when
+    await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+    // then
+    expect(await new RecallLedger(context.identityPaths.recallLedger).surfacedPaths(SESSION_ID)).toEqual(
+      new Set([ROLLOUTS_PATH]),
+    )
+    expect(await pending.take(SESSION_ID)).toEqual([])
+  }, 30_000)
+
+  test("#given an injected nudge #when the turn starts #then the visible trace entry names the surfaced path", async () => {
+    // given
+    const { repo, context } = await fixture()
+    await new PendingNudges(context.identityPaths.recallPending).write(SESSION_ID, [NUDGE])
+    const pi = new MemoryFakeExtensionAPI()
+    wiringFor({ repo, identity: context }).register(pi)
+
+    // when
+    await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+    // then
+    expect(pi.entries).toEqual([{ customType: RECALL_CUSTOM_TYPE, data: { paths: [ROLLOUTS_PATH] } }])
+  }, 30_000)
+
+  test("#given a failing ledger #when a nudge is injected #then the injection still lands and the failure is logged", async () => {
+    // given: bookkeeping is advisory, so it must never consume an already-composed nudge
+    const { repo, context } = await fixture()
+    await new PendingNudges(context.identityPaths.recallPending).write(SESSION_ID, [NUDGE])
+    const logs: Array<{ message: string; details?: unknown }> = []
+    class BrokenLedger extends RecallLedger {
+      override async markSurfaced(): Promise<void> {
+        throw new Error("ledger unavailable")
+      }
+    }
+    const pi = new MemoryFakeExtensionAPI()
+    wiringFor({
+      repo,
+      identity: context,
+      logs,
+      ledgerFor: (identity) => new BrokenLedger(identity.identityPaths.recallLedger),
+    }).register(pi)
+
+    // when
+    const result = await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+    // then
+    expect(result?.message?.content).toBe(renderNudgeBlock(NUDGE))
+    expect(logs.length).toBeGreaterThan(0)
+  }, 30_000)
+
+  test("#given a host whose appendEntry throws #when a nudge is injected #then the model still receives it", async () => {
+    // given
+    const { repo, context } = await fixture()
+    await new PendingNudges(context.identityPaths.recallPending).write(SESSION_ID, [NUDGE])
+    const logs: Array<{ message: string; details?: unknown }> = []
+    const pi = new MemoryFakeExtensionAPI()
+    pi.appendEntry = (): void => {
+      throw new Error("entry channel unavailable")
+    }
+    wiringFor({ repo, identity: context, logs }).register(pi)
+
+    // when
+    const result = await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+    // then
+    expect(result?.message?.content).toBe(renderNudgeBlock(NUDGE))
+    expect(logs.length).toBeGreaterThan(0)
+  }, 30_000)
+
+  test("#given no pending nudge #when before_agent_start dispatches #then no message and no entry are produced", async () => {
+    // given
+    const { repo, context } = await fixture()
+    const pi = new MemoryFakeExtensionAPI()
+    wiringFor({ repo, identity: context }).register(pi)
+
+    // when
+    const result = await dispatch(pi, eventContext([userEntry("m1", KUBERNETES_PROMPT)]), KUBERNETES_PROMPT)
+
+    // then
+    expect(result).toBeUndefined()
+    expect(pi.entries).toEqual([])
+  }, 30_000)
+
+  test("#given recall disabled by config #when a nudge is pending #then nothing is injected", async () => {
+    // given
+    const { repo, context } = await fixture()
+    await new PendingNudges(context.identityPaths.recallPending).write(SESSION_ID, [NUDGE])
+    const pi = new MemoryFakeExtensionAPI()
+    wiringFor({ repo, identity: context, recall: { enabled: false } }).register(pi)
+
+    // when
+    const result = await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+    // then
+    expect(result).toBeUndefined()
+    expect(pi.entries).toEqual([])
+  }, 30_000)
+
+  test("#given a memory worker child sentinel #when a nudge is pending #then the child receives nothing", async () => {
+    // given: a gate child must never be handed the very hints it exists to produce
+    const { repo, context } = await fixture()
+    await new PendingNudges(context.identityPaths.recallPending).write(SESSION_ID, [NUDGE])
+
+    for (const sentinel of ["SENPI_MEMORY_REFLECTION", "SENPI_MEMORY_FACTS", "SENPI_MEMORY_MEMORIAN"]) {
+      const pi = new MemoryFakeExtensionAPI()
+      wiringFor({ repo, identity: context, env: { [sentinel]: "1" } }).register(pi)
+
+      // when
+      const result = await dispatch(pi, eventContext([userEntry("m1", "anything at all")]))
+
+      // then
+      expect({ sentinel, result, entries: pi.entries }).toEqual({ sentinel, result: undefined, entries: [] })
+    }
+  }, 30_000)
 })
 
 describe("createMemoryRecallWiring before_agent_start", () => {
@@ -303,15 +455,40 @@ describe("createMemoryRecallWiring collectCandidates", () => {
     const { repo, context } = await fixture()
     const reflection = wiringFor({ repo, identity: context, env: { SENPI_MEMORY_REFLECTION: "1" } })
     const facts = wiringFor({ repo, identity: context, env: { SENPI_MEMORY_FACTS: "1" } })
+    const memorian = wiringFor({ repo, identity: context, env: { SENPI_MEMORY_MEMORIAN: "1" } })
 
     // when
     const ctx = eventContext([userEntry("m1", KUBERNETES_PROMPT)])
     const reflectionCollected = await reflection.collectCandidates(ctx)
     const factsCollected = await facts.collectCandidates(ctx)
+    const memorianCollected = await memorian.collectCandidates(ctx)
 
     // then
     expect(reflectionCollected).toBeUndefined()
     expect(factsCollected).toBeUndefined()
+    // A gate child must not spawn a second gate over its own transcript.
+    expect(memorianCollected).toBeUndefined()
+  }, 30_000)
+
+  test("#given a settled turn #when candidates are collected #then the judge input carries both roles and the surfaced set", async () => {
+    // given: the PLANNER stays user-only; the JUDGE's window is user+assistant
+    const { repo, context } = await fixture()
+    const wiring = wiringFor({ repo, identity: context })
+
+    // when
+    const collected = await wiring.collectCandidates(
+      eventContext([
+        userEntry("m1", KUBERNETES_PROMPT),
+        assistantEntry("a1", "I will check the rollout runbook"),
+      ]),
+    )
+
+    // then
+    expect(collected?.transcript).toEqual([
+      { role: "user", text: KUBERNETES_PROMPT },
+      { role: "assistant", text: "I will check the rollout runbook" },
+    ])
+    expect(collected?.surfaced).toEqual(new Set<string>())
   }, 30_000)
 
   test("#given an unbound session #when candidates are collected #then nothing is collected", async () => {

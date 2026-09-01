@@ -9,24 +9,28 @@
 // The lexical auto-injection path is GONE: nothing is injected from a plain corpus match. Candidate
 // collection now runs at SETTLE time (the turn is complete there, so the current-prompt seam
 // disappears) and feeds the memorian gate child, whose validated nudges are what a later turn
-// injects. Every step stays fail-open: an unreadable memory repo or a corrupt corpus drops the
-// collection and logs, and the turn proceeds untouched.
+// injects. before_agent_start is the delivery half: it only drains the pending file the gate wrote.
+// Every step stays fail-open: an unreadable memory repo or a corrupt corpus drops the collection
+// and logs, and the turn proceeds untouched.
 
 import type { OmoMemorySettings } from "@oh-my-opencode/omo-config-core"
 import {
   GitMemoryRepo,
+  PendingNudges,
   RecallCorpusCache,
   RecallLedger,
   planRecallQueries,
+  renderNudgeBlock,
   selectRecallCandidates,
   type RecallCandidate,
+  type RecallNudge,
 } from "@oh-my-opencode/memory-core"
 
 import type { ComponentLogger } from "../../extension/types"
 import type { MemoryExtensionAPI } from "./capabilities"
 import type { MemoryIdentityContext } from "./context"
 import { MEMORY_NOTICE_CUSTOM_TYPE } from "./prompt"
-import { renderRecallEntry } from "./recall-notice"
+import { renderRecallEntry, type MemoryRecallRecord } from "./recall-notice"
 import { resolveMemorySettings } from "./identity-runtime"
 
 export interface ResolvedMemoryRecallSettings {
@@ -60,7 +64,19 @@ export interface MemoryRecallWiringOptions {
   readonly createRepo?: (context: MemoryIdentityContext) => GitMemoryRepo
   readonly corpusCache?: RecallCorpusCache
   readonly ledgerFor?: (context: MemoryIdentityContext) => RecallLedger
+  readonly pendingFor?: (context: MemoryIdentityContext) => PendingNudgesPort
   readonly logger?: ComponentLogger
+}
+
+/** The pending handoff the gate writes and this turn drains; `take` is read-and-delete. */
+export interface PendingNudgesPort {
+  take(sessionId: string): Promise<RecallNudge[]>
+}
+
+/** One line of the judge's transcript window: both roles, oldest first. */
+export interface RecallTranscriptTurn {
+  readonly role: "user" | "assistant"
+  readonly text: string
 }
 
 /** Everything the memorian gate child needs about one settled turn's lexical candidates. */
@@ -68,6 +84,16 @@ export interface CollectedRecallCandidates {
   readonly sessionId: string
   readonly context: MemoryIdentityContext
   readonly candidates: readonly RecallCandidate[]
+  /** Already-surfaced paths: the persona sees them, the parent validator re-checks them. */
+  readonly surfaced: ReadonlySet<string>
+  /** Authoritative cap (memory.recall.max_items) resolved for the bound agent. */
+  readonly maxItems: number
+  /**
+   * The judge's window. USER+ASSISTANT, unlike the planner's user-only input: matching keys on
+   * user intent, but judging needs to see what the agent already said to avoid nudging a fact the
+   * turn has covered.
+   */
+  readonly transcript: readonly RecallTranscriptTurn[]
 }
 
 export interface MemoryRecallWiring {
@@ -77,13 +103,22 @@ export interface MemoryRecallWiring {
 }
 
 // A memory worker child must never receive recall hints: it reasons ABOUT memory, and an injected
-// hint would both pollute its transcript and re-enter memory on the next extraction pass.
-const CHILD_SENTINELS = ["SENPI_MEMORY_REFLECTION", "SENPI_MEMORY_FACTS"] as const
+// hint would both pollute its transcript and re-enter memory on the next extraction pass. The
+// memorian sentinel is here for the sharper reason: a gate child that received nudges would judge
+// the hints it exists to produce, and would spawn a gate over its own transcript.
+const CHILD_SENTINELS = ["SENPI_MEMORY_REFLECTION", "SENPI_MEMORY_FACTS", "SENPI_MEMORY_MEMORIAN"] as const
+
+/**
+ * Provenance recorded next to a surfaced path. The ledger keys on the path alone - the hash exists
+ * so a reader can tell a gate-delivered hint from a lexically matched one.
+ */
+const GATE_SURFACE_HASH = "memorian-gate"
 
 export function createMemoryRecallWiring(options: MemoryRecallWiringOptions): MemoryRecallWiring {
   const corpusCache = options.corpusCache ?? new RecallCorpusCache()
   const createRepo = options.createRepo ?? defaultCreateRepo
   const ledgerFor = options.ledgerFor ?? ((context) => new RecallLedger(context.identityPaths.recallLedger))
+  const pendingFor = options.pendingFor ?? ((context) => new PendingNudges(context.identityPaths.recallPending))
 
   async function collect(eventCtx: unknown): Promise<CollectedRecallCandidates | undefined> {
     if (CHILD_SENTINELS.some((sentinel) => options.env[sentinel] === "1")) return undefined
@@ -109,20 +144,86 @@ export function createMemoryRecallWiring(options: MemoryRecallWiringOptions): Me
     if (corpus.documents.length === 0) return undefined
 
     const ledger = ledgerFor(context)
+    const surfaced = await ledger.surfacedPaths(session.id)
     const candidates = selectRecallCandidates(corpus.documents, queries, {
       maxItems: recall.max_items,
-      surfaced: await ledger.surfacedPaths(session.id),
+      surfaced,
     })
     if (candidates.length === 0) return undefined
-    return { sessionId: session.id, context, candidates }
+    return {
+      sessionId: session.id,
+      context,
+      candidates,
+      surfaced,
+      maxItems: recall.max_items,
+      transcript: judgeTranscript(session.entries),
+    }
+  }
+
+  /** Drain the gate's pending nudges for this turn. Returns undefined when there is nothing to say. */
+  async function inject(payload: unknown, eventCtx: unknown): Promise<RecallInjection | undefined> {
+    if (!isBeforeAgentStart(payload)) return undefined
+    if (CHILD_SENTINELS.some((sentinel) => options.env[sentinel] === "1")) return undefined
+    const session = readSession(eventCtx)
+    if (session === undefined) return undefined
+    const context = options.resolveContext(session.id)
+    if (context === undefined) return undefined
+    if (resolveAgentRecallSettings(options.resolveSettings(), context.identity).enabled === false) return undefined
+
+    const nudges = await pendingFor(context).take(session.id)
+    if (nudges.length === 0) return undefined
+
+    // Composed BEFORE any bookkeeping: marking is advisory, so its failure must never consume or
+    // suppress a nudge the judge already paid for.
+    const injection: RecallInjection = {
+      result: {
+        message: {
+          customType: RECALL_CUSTOM_TYPE,
+          content: nudges.map(renderNudgeBlock).join("\n"),
+          display: false,
+        },
+      },
+      paths: nudges.map((nudge) => nudge.path),
+    }
+
+    try {
+      await ledgerFor(context).markSurfaced(
+        session.id,
+        nudges.map((nudge) => ({ path: nudge.path, hash: GATE_SURFACE_HASH })),
+      )
+    } catch (error) {
+      // Fail-open: an unrecorded path simply stays eligible for a later gate run.
+      options.logger?.warn("omo-senpi memory recall ledger mark skipped", {
+        sessionId: session.id,
+        error: describe(error),
+      })
+    }
+    return injection
   }
 
   return {
-    // The injection half of the channel is the gate's, not a lexical match's: the renderer stays so
-    // the visible trace keeps working, and the message handler returns with the nudge handoff
-    // (plan todo 8).
     register(pi): void {
       pi.registerEntryRenderer(RECALL_CUSTOM_TYPE, renderRecallEntry)
+      pi.on("before_agent_start", async (payload, eventCtx) => {
+        try {
+          const injection = await inject(payload, eventCtx)
+          if (injection === undefined) return undefined
+          try {
+            // Visible half: the model-facing message is display:false, so without this entry the
+            // user would see a memory-shaped answer with no trace of where it came from.
+            pi.appendEntry(RECALL_CUSTOM_TYPE, { paths: injection.paths } satisfies MemoryRecallRecord)
+          } catch (error) {
+            // Fail-open: the visible trace is bookkeeping - its failure must never suppress a
+            // nudge the ledger already recorded as delivered.
+            options.logger?.warn("omo-senpi memory recall trace entry skipped", { error: describe(error) })
+          }
+          return injection.result
+        } catch (error) {
+          // Read-only advice: any failure skips the injection and leaves the turn untouched.
+          options.logger?.warn("omo-senpi memory recall skipped", { error: describe(error) })
+          return undefined
+        }
+      })
     },
     async collectCandidates(eventCtx): Promise<CollectedRecallCandidates | undefined> {
       try {
@@ -136,9 +237,49 @@ export function createMemoryRecallWiring(options: MemoryRecallWiringOptions): Me
   }
 }
 
+interface RecallInjection {
+  readonly result: {
+    readonly message: {
+      readonly customType: typeof RECALL_CUSTOM_TYPE
+      readonly content: string
+      readonly display: false
+    }
+  }
+  readonly paths: readonly string[]
+}
+
 interface RecallSession {
   readonly id: string
   readonly entries: readonly unknown[]
+}
+
+function isBeforeAgentStart(payload: unknown): boolean {
+  return isRecord(payload) && payload.type === "before_agent_start"
+}
+
+/**
+ * The judge's window, oldest first: both roles, memory-owned hidden channels excluded for the same
+ * reason the planner excludes them - a previous hint is not conversation.
+ */
+function judgeTranscript(entries: readonly unknown[]): RecallTranscriptTurn[] {
+  const turns: RecallTranscriptTurn[] = []
+  for (let index = entries.length - 1; index >= 0 && turns.length < RECALL_TEXT_WINDOW; index -= 1) {
+    const turn = judgeTurn(entries[index])
+    if (turn !== undefined) turns.push(turn)
+  }
+  return turns.reverse()
+}
+
+function judgeTurn(entry: unknown): RecallTranscriptTurn | undefined {
+  if (!isRecord(entry)) return undefined
+  if (entry.type !== "message") return undefined
+  const message = entry.message
+  if (!isRecord(message)) return undefined
+  if (message.role !== "user" && message.role !== "assistant") return undefined
+  if (typeof message.customType === "string" && EXCLUDED_CUSTOM_TYPES.has(message.customType)) return undefined
+  const text = textOf(message.content)
+  if (text.trim().length === 0) return undefined
+  return { role: message.role, text }
 }
 
 function readSession(eventCtx: unknown): RecallSession | undefined {
