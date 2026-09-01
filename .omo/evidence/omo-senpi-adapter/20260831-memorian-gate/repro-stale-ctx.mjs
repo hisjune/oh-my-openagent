@@ -10,6 +10,12 @@
 //   OBSERVED_WARNING=memorian gate launch failed ... "This extension ctx is stale after ..."
 //   REPRO=CONFIRMED
 //
+// POST stale-ctx fix (d2085bc5 + d6d2f8b0): REPRO=NOT-REPRODUCED and the gate child DOES launch.
+// reflection.sandbox "off" is a HARNESS requirement only: the stub records its invocations to a log
+// under the sandbox ROOT, while the production sandbox profile (correctly) allows writes only inside
+// the scratch run dir, so under the default "auto" the stub itself dies with EPERM before it can
+// report that it ran. The production sandbox policy is covered by its own unit tests.
+//
 // The stub installed through the production SENPI_BIN seam records every gate-child launch. Zero
 // invocations plus the stale-ctx warning IS the defect: candidate collection succeeded (the runner
 // was entered), and the throw happens at resolveModelRegistry() inside launchOnce.
@@ -39,7 +45,7 @@ writeFileSync(
   JSON.stringify(
     {
       categories: { quick: { description: "QA mock quick category", model: "omo-mock/mock-1" } },
-      memory: { enabled: true, reflection: { trigger: { step_count: 0, on_compaction: false } } },
+      memory: { enabled: true, reflection: { trigger: { step_count: 0, on_compaction: false }, sandbox: "off" } },
     },
     null,
     2,

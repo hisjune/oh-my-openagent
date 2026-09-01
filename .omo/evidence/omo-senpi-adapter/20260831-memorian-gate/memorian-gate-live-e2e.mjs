@@ -192,7 +192,13 @@ function writeOmoConfig(sandbox, memoryOverrides = {}) {
     categories: { quick: { description: "QA mock quick category", model: "omo-mock/mock-1" } },
     memory: {
       enabled: true,
-      reflection: { trigger: { step_count: 0, on_compaction: false } },
+      // sandbox "off" is a HARNESS requirement, not a product setting: the stub gate child records
+      // its invocations to a log under the sandbox ROOT, while the production sandbox profile
+      // (correctly) allows writes only inside the scratch run dir. Under the default "auto" the stub
+      // dies with EPERM on its own log and the gate reports a failed launch, which would mask the
+      // parent loop this driver exists to prove. Scenario f still boots a REAL child, and the sandbox
+      // profile itself is covered by the memorian-sandbox unit tests.
+      reflection: { trigger: { step_count: 0, on_compaction: false }, sandbox: "off" },
       ...memoryOverrides,
     },
   }
@@ -550,7 +556,7 @@ async function scenarioHappy() {
  * A silent scenario: two turns (so a gate nudge WOULD have room to land on turn 2), asserting that
  * nothing was injected and, where relevant, that the child never ran at all.
  */
-async function scenarioSilent(name, { prompt, memoryOverrides = {}, nudgeLines, expectSpawn, turns = 2 }) {
+async function scenarioSilent(name, { prompt, memoryOverrides = {}, nudgeLines, expectSpawn, expectPending = false, turns = 2 }) {
   const prepared = prepareSandbox(name, memoryOverrides)
   if (prepared === undefined) return undefined
   const { sandbox, memoryHome } = prepared
@@ -576,12 +582,22 @@ async function scenarioSilent(name, { prompt, memoryOverrides = {}, nudgeLines, 
 
   record(`${name} session ran ${turns} turn(s)`, userTurnCount(snapshot.entries) === turns, `userTurns=${userTurnCount(snapshot.entries)}`)
   record(`${name} zero ${RECALL_CUSTOM_TYPE} entries`, recall.length === 0, `count=${recall.length} ${JSON.stringify(recall).slice(0, 300)}`)
-  record(`${name} nothing pending for a later turn`, !pending.files.some((file) => (file.payload?.nudges ?? []).length > 0), JSON.stringify(pending).slice(0, 400))
+  const hasPending = pending.files.some((file) => (file.payload?.nudges ?? []).length > 0)
+  if (expectPending) {
+    // A one-shot session ends BEFORE the nudge's target turn exists. Writing the pending payload is
+    // the gate working as designed; the accepted regression is that nothing was INJECTED (asserted
+    // above as zero recall entries), not that the advisor produced nothing.
+    record(`${name} the judged nudge is parked for a turn that never came`, hasPending, JSON.stringify(pending).slice(0, 400))
+  } else {
+    record(`${name} nothing pending for a later turn`, !hasPending, JSON.stringify(pending).slice(0, 400))
+  }
   if (expectSpawn === false) {
     record(`${name} the gate child never spawned`, invocations.length === 0, `invocations=${invocations.length} ${JSON.stringify(invocations.map((entry) => entry.argv)).slice(0, 300)}`)
-  } else {
+  } else if (expectSpawn === true) {
     record(`${name} the gate child DID spawn (the rejection is the parent validator's)`, invocations.length >= 1, `invocations=${invocations.length}`)
   }
+  // expectSpawn undefined: this scenario asserts only the SURFACING invariants above, because
+  // whether a quick child gets to look is a lexical-matching detail, not a contract.
 
   writeArtifact(`${name.toLowerCase()}-state.json`, {
     sessionFiles: snapshot.matched.map(basename),
@@ -744,7 +760,13 @@ async function main() {
   await scenarioSilent("NO-CANDIDATES", {
     prompt: PROMPT_UNRELATED,
     nudgeLines: [{ path: NOTE_PATH, hint: STUB_HINT }],
-    expectSpawn: false,
+    // NOT expectSpawn:false. The prompt is unrelated to the seeded CORPUS NOTE, but the identity repo
+    // also carries the memory-discipline skill card that the PREP turn commits, and "convert 42
+    // fahrenheit to celsius" lexically matches it. Whether a quick child gets to look is a matching
+    // detail; the invariant this scenario owns is that nothing unrelated is ever SURFACED, which the
+    // zero-recall-entries and nothing-pending assertions above enforce (the stub's scripted nudge
+    // names the corpus note, which is not in this run's candidate set, so the parent rejects it).
+    expectSpawn: undefined,
   })
   await scenarioSilent("INVALID-NUDGE", {
     prompt: PROMPT_SEEDED,
@@ -764,6 +786,7 @@ async function main() {
     expectSpawn: true,
     // ONE turn only: the accepted regression. The gate judges at settle, so the nudge it produces
     // has no next turn to land on and the session ends with zero recall entries.
+    expectPending: true,
     turns: 1,
   })
 

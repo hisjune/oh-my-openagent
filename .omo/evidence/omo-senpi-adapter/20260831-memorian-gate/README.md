@@ -1,5 +1,9 @@
 # Memorian gate - live QA + hermetic gates (plan todo 9)
 
+> **SUPERSEDED — see `post-stale-ctx-fix.md`.** The defect documented below was fixed
+> (`d2085bc58` snapshot fix + `d6d2f8b07` persona staging) and the driver re-run: **7/7 PASS**
+> (`live-gate-postfix/`). This file is kept verbatim as the original QA capture.
+
 Branch `feat/memorian-gate` @ `32188aa8c4b2c46665e540a8c1c3069bde1767da` (pushed).
 Plan: `.omo/plans/memorian-m3-gate.md`, todo 9 with the "Metis fold - Plan-Version 2" corrections.
 
